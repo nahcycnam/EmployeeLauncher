@@ -1,0 +1,14 @@
+{
+    "window": {
+        "x": 1343,
+        "y": 15
+    },
+    "table": {
+        "font_family": "Microsoft YaHei, 微软雅黑, Segoe UI",
+        "font_size": 22,
+        "font_weight": "bold",
+        "italic": false,
+        "color": "#FFFFFF",
+        "item_padding": "2px 5px"
+    }
+}
