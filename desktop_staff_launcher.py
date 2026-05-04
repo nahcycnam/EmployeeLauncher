@@ -2,12 +2,75 @@ import sys
 import os
 import json
 import subprocess
+import ctypes
+from ctypes import wintypes
 import pandas as pd
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPalette, QColor, QPaintEvent, QFont
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
+
+# --- Windows API 常量与函数定义 ---
+WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP   = 0x0205
+SW_SHOW = 5
+
+user32 = ctypes.windll.user32
+
+# 定义 POINT 结构
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+# 获取桌面窗口句柄（适用于 Windows 10/11）
+def get_desktop_hwnd():
+    # 首先尝试找到 SysListView32 (桌面图标列表)
+    def find_syslistview_hwnd(hwnd, lparam):
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        if class_name.value == "SysListView32":
+            # 找到直接返回，通过 ctypes 的返回值无法直接传递，使用全局变量
+            found_hwnd = ctypes.c_void_p()
+            found_hwnd.value = hwnd
+            # 将 hwnd 存入 lparam 指向的指针
+            ctypes.memmove(lparam, ctypes.byref(found_hwnd), ctypes.sizeof(ctypes.c_void_p))
+            return False  # 继续枚举，但实际已经记录
+        return True
+
+    # 先找 WorkerW 或 Progman
+    desktop = user32.FindWindowW("Progman", None)
+    if not desktop:
+        desktop = user32.FindWindowW("WorkerW", None)
+    if not desktop:
+        return None
+
+    # 枚举子窗口查找 SysListView32
+    # 使用 EnumChildWindows 回调
+    found = wintypes.HWND()
+    def enum_callback(hwnd, lparam):
+        class_name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_name, 256)
+        if class_name.value == "SysListView32":
+            # 找到，保存到 lparam 指向的 HWND
+            ctypes.memmove(lparam, ctypes.byref(wintypes.HWND(hwnd)), ctypes.sizeof(wintypes.HWND))
+            return False  # 停止枚举
+        return True
+
+    EnumChildWindows = user32.EnumChildWindows
+    EnumChildWindows.argtypes = [wintypes.HWND, ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+    EnumChildWindows.restype = ctypes.c_bool
+
+    # 定义回调
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    callback = callback_type(enum_callback)
+
+    result_hwnd = wintypes.HWND()
+    EnumChildWindows(desktop, callback, wintypes.LPARAM(ctypes.addressof(result_hwnd)))
+    if result_hwnd.value:
+        return result_hwnd.value
+    # 如果没找到，直接返回桌面顶层窗口
+    return desktop
 
 
 class DesktopTableWindow(QMainWindow):
@@ -56,6 +119,7 @@ class DesktopTableWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.table = ClickableTableWidget()
+        self.table.parent_window = self  # 让表格能访问主窗口
 
         # 应用 JSON 中的字体设置（QFont）
         font_cfg = self.config["table"]
@@ -222,6 +286,23 @@ class DesktopTableWindow(QMainWindow):
         except Exception as e:
             print(f"启动程序时出错：{e}")
 
+    def send_right_click_to_desktop(self, global_x, global_y):
+        """向桌面窗口发送右键消息，弹出原生右键菜单"""
+        desktop_hwnd = get_desktop_hwnd()
+        if not desktop_hwnd:
+            print("警告：未找到桌面窗口句柄")
+            return
+
+        # 将屏幕坐标转换为桌面窗口客户区坐标
+        pt = POINT(global_x, global_y)
+        user32.ScreenToClient(desktop_hwnd, ctypes.byref(pt))
+
+        # 发送鼠标按下和弹起消息
+        lparam = (pt.y << 16) | (pt.x & 0xFFFF)
+        user32.PostMessageW(desktop_hwnd, WM_RBUTTONDOWN, 0, lparam)
+        user32.PostMessageW(desktop_hwnd, WM_RBUTTONUP, 0, lparam)
+        print(f"已向桌面发送右键消息，坐标：({global_x}, {global_y})")
+
     def paintEvent(self, event: QPaintEvent):
         super().paintEvent(event)
 
@@ -232,7 +313,6 @@ class DesktopTableWindow(QMainWindow):
 
     def set_window_to_bottom(self):
         try:
-            import ctypes
             HWND_BOTTOM = 1
             SWP_NOMOVE = 0x0002
             SWP_NOSIZE = 0x0001
@@ -273,6 +353,19 @@ class ClickableTableWidget(QTableWidget):
                 print("父窗口没有 on_cell_double_click 方法")
         else:
             print("未命中有效单元格")
+
+    def contextMenuEvent(self, event):
+        """右键事件：穿透给真正的桌面"""
+        # 获取鼠标的全局坐标
+        global_pos = event.globalPos()
+        parent = getattr(self, 'parent_window', None)
+        if parent is None:
+            parent = self.window()
+        if hasattr(parent, 'send_right_click_to_desktop'):
+            parent.send_right_click_to_desktop(global_pos.x(), global_pos.y())
+        else:
+            print("父窗口没有 send_right_click_to_desktop 方法")
+        event.accept()  # 阻止表格本身弹出任何菜单，但事件已转发
 
 
 class SingleInstance:
